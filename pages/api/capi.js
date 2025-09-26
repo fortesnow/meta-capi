@@ -12,6 +12,14 @@ function sha256Normalize(v) {
   return crypto.createHash("sha256").update(norm).digest("hex");
 }
 
+function getCookie(name, cookieString) {
+  if (!cookieString) return null;
+  const value = `; ${cookieString}`;
+  const parts = value.split(`; ${name}=`);
+  if (parts.length === 2) return parts.pop().split(';').shift();
+  return null;
+}
+
 export default async function handler(req, res) {
   // CORS
   if (req.method === "OPTIONS") {
@@ -23,11 +31,36 @@ export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "method_not_allowed" });
 
   const origin = req.headers.origin || "";
-  if (ALLOWED_ORIGIN !== "*" && !origin.startsWith(ALLOWED_ORIGIN)) {
-    return res.status(403).json({ error: "forbidden_origin" });
+  const referer = req.headers.referer || "";
+  
+  // CORS チェック（複数オリジン対応）
+  const allowedOrigins = [
+    "https://iedukuri-soudan.jp",
+    "https://www.iedukuri-soudan.jp", 
+    "https://studio.iedukuri-soudan.jp"  // studio用
+  ];
+  
+  const isAllowedOrigin = ALLOWED_ORIGIN === "*" || 
+    allowedOrigins.some(allowed => origin.startsWith(allowed) || referer.startsWith(allowed));
+  
+  if (!isAllowedOrigin) {
+    console.log('CORS Error:', { origin, referer, allowedOrigins });
+    return res.status(403).json({ 
+      error: "forbidden_origin", 
+      debug: { origin, referer, allowedOrigins }
+    });
   }
 
   try {
+    // 環境変数の確認
+    if (!PIXEL_ID || !TOKEN) {
+      console.error('Missing environment variables:', { PIXEL_ID: !!PIXEL_ID, TOKEN: !!TOKEN });
+      return res.status(500).json({ 
+        error: "missing_config", 
+        debug: { hasPixelId: !!PIXEL_ID, hasToken: !!TOKEN }
+      });
+    }
+
     const {
       event_name,
       event_time,
@@ -40,14 +73,29 @@ export default async function handler(req, res) {
       test_event_code  // Test Events用（開発時のみ付与）
     } = req.body || {};
 
+    console.log('CAPI Request received:', { 
+      event_name, 
+      event_id, 
+      action_source, 
+      hasUser: !!user,
+      pixelId: PIXEL_ID,
+      body: req.body 
+    });
+
     const ip = client_ip || (req.headers["x-forwarded-for"] || "").split(",")[0] || req.socket.remoteAddress;
     const ua = client_ua || req.headers["user-agent"] || "";
+    
+    // Studio側のペイロード形式に対応
+    const normalizedUser = user || {};
+    const cookieString = req.headers.cookie || '';
+    const fbp = normalizedUser.fbp || getCookie('_fbp', cookieString) || null;
+    const fbc = normalizedUser.fbc || getCookie('_fbc', cookieString) || null;
 
     const user_data = {
-      em: user?.email ? [sha256Normalize(user.email)] : undefined,
-      ph: user?.phone ? [sha256Normalize(user.phone)] : undefined,
-      fbp: user?.fbp,
-      fbc: user?.fbc,
+      em: normalizedUser?.email ? [sha256Normalize(normalizedUser.email)] : undefined,
+      ph: normalizedUser?.phone ? [sha256Normalize(normalizedUser.phone)] : undefined,
+      fbp: fbp,
+      fbc: fbc,
       client_ip_address: ip,
       client_user_agent: ua,
     };
@@ -65,6 +113,12 @@ export default async function handler(req, res) {
     };
 
     const url = `https://graph.facebook.com/${API_VER}/${PIXEL_ID}/events?access_token=${TOKEN}`;
+    
+    console.log('Sending to Meta API:', {
+      url: url.replace(TOKEN, 'TOKEN_HIDDEN'),
+      payload: JSON.stringify(payload, null, 2)
+    });
+
     const fbRes = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -72,10 +126,21 @@ export default async function handler(req, res) {
     });
     const json = await fbRes.json();
 
+    console.log('Meta API Response:', {
+      status: fbRes.status,
+      ok: fbRes.ok,
+      response: json
+    });
+
     res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
     return res.status(fbRes.ok ? 200 : 400).json(json);
   } catch (e) {
+    console.error('CAPI Server Error:', e);
     res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-    return res.status(500).json({ error: "server_error", detail: String(e) });
+    return res.status(500).json({ 
+      error: "server_error", 
+      detail: String(e),
+      debug: process.env.NODE_ENV === 'development' ? e.stack : undefined
+    });
   }
 }
